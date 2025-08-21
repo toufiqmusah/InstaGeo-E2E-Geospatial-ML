@@ -23,8 +23,10 @@ class DINOv3VITBlock(nn.Module):
         self.patch_size = self.dinov3_model.config.patch_size
         self.num_layers = self.dinov3_model.config.num_hidden_layers
 
+        # Input projection to convert 18 channels to 3 for DINOv3
         self.input_proj = nn.Conv2d(18, 3, kernel_size=1, bias=False)
 
+        # Feature projections for each hierarchical level
         self.feature_projections = nn.ModuleList([
             nn.Conv2d(self.embed_dim, 64, kernel_size=1),
             nn.Conv2d(self.embed_dim, 128, kernel_size=1),
@@ -34,9 +36,8 @@ class DINOv3VITBlock(nn.Module):
         ])
 
     def extract_hierarchical_features(self, x):
-        """
-        Extracting hierarchical features from different DINOv3 transformer layers
-        """
+        """Extract hierarchical features from different DINOv3 transformer layers"""
+        
         # Handle different input dimensions
         original_shape = x.shape
         
@@ -60,8 +61,10 @@ class DINOv3VITBlock(nn.Module):
         if x.shape[1] != 18:
             raise ValueError(f"Expected 18 channels, got {x.shape[1]} channels. Input shape: {original_shape}")
 
+        # Project to 3 channels for DINOv3
         x_proj = self.input_proj(x)
 
+        # Ensure dimensions are compatible with patch size
         target_h = (H // self.patch_size) * self.patch_size
         target_w = (W // self.patch_size) * self.patch_size
 
@@ -69,10 +72,12 @@ class DINOv3VITBlock(nn.Module):
             x_proj = F.interpolate(x_proj, size=(target_h, target_w),
                                   mode='bilinear', align_corners=False)
 
+        # Extract features from DINOv3
         with torch.set_grad_enabled(self.dinov3_model.training):
             outputs = self.dinov3_model(x_proj, output_hidden_states=True)
             hidden_states = outputs.hidden_states
 
+        # Select layer indices for hierarchical features
         layer_indices = [
             max(1, self.num_layers // 6),
             self.num_layers // 3,
@@ -84,15 +89,19 @@ class DINOv3VITBlock(nn.Module):
         hierarchical_features = []
 
         for i, layer_idx in enumerate(layer_indices):
+            # Get patch features (skip CLS token and other special tokens)
             patch_features = hidden_states[layer_idx][:, 5:]
 
+            # Calculate number of patches
             num_patches_h = target_h // self.patch_size
             num_patches_w = target_w // self.patch_size
 
+            # Reshape to spatial format
             spatial_features = patch_features.reshape(
                 process_batch_size, num_patches_h, num_patches_w, self.embed_dim
             ).permute(0, 3, 1, 2)
 
+            # Resize to original spatial dimensions if needed
             if spatial_features.shape[2:] != (H, W):
                 spatial_features = F.interpolate(
                     spatial_features, size=(H, W),
@@ -106,6 +115,7 @@ class DINOv3VITBlock(nn.Module):
                 T_orig = original_shape[2]
                 spatial_features = spatial_features.view(B_orig, T_orig, -1, H, W).mean(dim=1)
 
+            # Project features to desired dimensions
             projected_features = self.feature_projections[i](spatial_features)
             hierarchical_features.append(projected_features)
 
@@ -144,6 +154,7 @@ class EncoderBlock(nn.Module):
     def forward(self, x, dinov3_features=None):
         x = self.mednext_block(x)
 
+        # Add DINOv3 features if provided
         if dinov3_features is not None:
             if x.shape[2:] != dinov3_features.shape[2:]:
                 dinov3_features = F.interpolate(
@@ -194,7 +205,6 @@ class DecoderBlock(nn.Module):
             self.combine_conv = None
 
     def forward(self, x, skip_features=None, use_skip=True):
-
         x = self.up_block(x)
 
         if use_skip and skip_features is not None and self.skip_channels is not None:
@@ -211,7 +221,6 @@ class DecoderBlock(nn.Module):
 
 
 class BiomassNet(nn.Module):
-
     """
     DINOv3-based network for Above-Ground Biomass estimation
     Input: 18 × 256 × 256 (3 timesteps × 6 bands × spatial)
@@ -225,13 +234,17 @@ class BiomassNet(nn.Module):
 
         self.use_skip_connections = use_skip_connections
         self.dinov3_backbone = DINOv3VITBlock(dinov3_model, freeze_dinov3)
+        
+        # Input convolution to process all channels
         self.input_conv = nn.Conv2d(in_channels, 64, kernel_size=3, padding=1)
 
+        # Encoder blocks
         self.encoder1 = EncoderBlock(64, 64)
         self.encoder2 = EncoderBlock(64, 128)
         self.encoder3 = EncoderBlock(128, 256)
         self.encoder4 = EncoderBlock(256, 512)
 
+        # Bottleneck
         self.bottleneck = nn.Sequential(
             MedNeXtBlock(512, 512, exp_r=4, kernel_size=7, do_res=True,
                         norm_type='group', dim='2d', grn=False),
@@ -239,21 +252,38 @@ class BiomassNet(nn.Module):
                         norm_type='group', dim='2d', grn=False)
         )
 
+        # Decoder blocks
         skip_channels = [64, 128, 256, 512] if use_skip_connections else [None]*4
         self.decoder4 = DecoderBlock(512, 256, skip_channels[3])
         self.decoder3 = DecoderBlock(256, 128, skip_channels[2])
         self.decoder2 = DecoderBlock(128, 64, skip_channels[1])
         self.decoder1 = DecoderBlock(64, 64, skip_channels[0])
 
+        # Output head
         self.output_conv = nn.Sequential(
             nn.Conv2d(64, 32, kernel_size=3, padding=1),
             nn.GroupNorm(8, 32),
             nn.ReLU(inplace=True),
             nn.Conv2d(32, out_channels, kernel_size=1),
-            nn.ReLU(inplace=True)
+            nn.ReLU(inplace=True)  # Ensure positive outputs for biomass
         )
 
+        # Initialize weights
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        """Initialize weights to ensure all parameters are used"""
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.GroupNorm):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
     def set_skip_connections(self, use_skip):
+        """Toggle skip connections"""
         self.use_skip_connections = use_skip
 
     def forward(self, x):
@@ -265,11 +295,14 @@ class BiomassNet(nn.Module):
             # Flatten temporal dimension into channels: (B, C*T, H, W)
             x = x.view(B, C * T, H, W)
         
+        # Extract hierarchical features from DINOv3
         dinov3_features = self.dinov3_backbone(x)
 
+        # Process input through initial convolution
         x = self.input_conv(x)
         skip_connections = []
 
+        # Encoder path with DINOv3 feature injection
         x, skip1 = self.encoder1(x, dinov3_features[0])
         skip_connections.append(skip1)
 
@@ -282,7 +315,8 @@ class BiomassNet(nn.Module):
         x, skip4 = self.encoder4(x, dinov3_features[3])
         skip_connections.append(skip4)
 
-        if dinov3_features[4] is not None:
+        # Add bottleneck features if available
+        if len(dinov3_features) > 4 and dinov3_features[4] is not None:
             bottleneck_features = dinov3_features[4]
             if x.shape[2:] != bottleneck_features.shape[2:]:
                 bottleneck_features = F.interpolate(
@@ -291,20 +325,33 @@ class BiomassNet(nn.Module):
                 )
             x = x + bottleneck_features
 
+        # Bottleneck processing
         x = self.bottleneck(x)
 
-        skip_connections = skip_connections[::-1]
+        # Decoder path with skip connections
+        skip_connections = skip_connections[::-1]  # Reverse for decoder
 
         x = self.decoder4(x, skip_connections[0], self.use_skip_connections)
         x = self.decoder3(x, skip_connections[1], self.use_skip_connections)
         x = self.decoder2(x, skip_connections[2], self.use_skip_connections)
         x = self.decoder1(x, skip_connections[3], self.use_skip_connections)
 
+        # Final output
         biomass_map = self.output_conv(x)
 
         return biomass_map
 
-'''# Test the model
+    def get_num_params(self):
+        """Get number of parameters"""
+        return sum(p.numel() for p in self.parameters())
+    
+    def get_num_trainable_params(self):
+        """Get number of trainable parameters"""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+'''
+
+# Test the model
 if __name__ == "__main__":
     model = BiomassNet(
         in_channels=18,
@@ -314,26 +361,28 @@ if __name__ == "__main__":
     )
 
     # Test with different input shapes
-    print("Testing different input shapes:")
+    print("Testing BiomassNet:")
     
     # 4D input (standard) - what your model expects
     print("\n1. Testing 4D input (B, C, H, W):")
-    x = torch.randn(4, 18, 128, 128)
+    x = torch.randn(2, 18, 128, 128)
     try:
         biomass_pred = model(x)
         print(f"Success! Input: {x.shape}, Output: {biomass_pred.shape}")
+        
+        # Test gradient flow
+        loss = biomass_pred.mean()
+        loss.backward()
+        
+        # Check if all parameters have gradients
+        params_with_grad = sum(1 for p in model.parameters() if p.grad is not None)
+        total_params = sum(1 for p in model.parameters())
+        print(f"Parameters with gradients: {params_with_grad}/{total_params}")
+        
     except Exception as e:
         print(f"Error with 4D input: {e}")
     
-    # 5D input (with temporal dimension) - if your dataloader provides this
-    print("\n2. Testing 5D input (B, C, T, H, W):")
-    x = torch.randn(4, 6, 3, 128, 128)  # 6 bands, 3 timesteps
-    try:
-        biomass_pred = model(x)
-        print(f"Success! Input: {x.shape}, Output: {biomass_pred.shape}")
-    except Exception as e:
-        print(f"Error with 5D input: {e}")
-    
-    print(f"\nModel parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
-'''
+    print(f"\nModel parameters: {model.get_num_params():,}")
+    print(f"Trainable parameters: {model.get_num_trainable_params():,}")
+
+    '''
