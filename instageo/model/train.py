@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 
 from instageo.model.model import PrithviSeg
+from instageo.model.biomassnet import BiomassNet
 
 
 class PrithviSegmentationModule(pl.LightningModule):
@@ -49,13 +50,14 @@ class PrithviSegmentationModule(pl.LightningModule):
                 from config.
         """
         super().__init__()
-        self.net = PrithviSeg(
-            image_size=image_size,
-            num_classes=num_classes,
-            temporal_step=temporal_step,
-            freeze_backbone=freeze_backbone,
-            depth=depth,
+
+        self.net = BiomassNet(
+            in_channels=18,
+            out_channels=num_classes,
+            dinov3_model="facebook/dinov3-vitl16-pretrain-sat493m",
+            freeze_dinov3=True
         )
+
         weight_tensor = torch.tensor(class_weights).float() if class_weights else None
         self.criterion = nn.CrossEntropyLoss(
             ignore_index=ignore_index, weight=weight_tensor
@@ -538,7 +540,7 @@ class PrithviRegressionModule(pl.LightningModule):
         freeze_backbone: bool = True,
         temporal_step: int = 1,
         weight_decay: float = 1e-2,
-        loss_function: str = "mse",
+        loss_function: str = "huber",
         ignore_index: int = -100,
         depth: int | None = None,
         log_transform: bool = False,
@@ -560,12 +562,11 @@ class PrithviRegressionModule(pl.LightningModule):
             log_transform (bool): Whether to apply log transformation to target values.
         """
         super().__init__()
-        self.net = PrithviSeg(
-            image_size=image_size,
-            num_classes=1,  # Single output channel for regression
-            temporal_step=temporal_step,
-            freeze_backbone=freeze_backbone,
-            depth=depth,
+        self.net = BiomassNet(
+            in_channels=18,
+            out_channels=1,
+            dinov3_model="facebook/dinov3-vitl16-pretrain-sat493m",
+            freeze_dinov3=True
         )
 
         # Choose loss function
