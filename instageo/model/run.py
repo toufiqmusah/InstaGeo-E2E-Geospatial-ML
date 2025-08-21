@@ -35,6 +35,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
+from pytorch_lightning.strategies import DDPStrategy
 
 from instageo.model.dataloader import (
     InstaGeoDataset,
@@ -384,6 +385,7 @@ def main(cfg: DictConfig) -> None:
             max_epochs=cfg.train.num_epochs,
             callbacks=[checkpoint_callback],
             logger=logger,
+            strategy=DDPStrategy(find_unused_parameters=True)
         )
 
         # run training and validation
