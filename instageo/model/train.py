@@ -575,7 +575,7 @@ class PrithviRegressionModule(pl.LightningModule):
         elif loss_function == "mae":
             self.criterion = nn.L1Loss(reduction="none")
         elif loss_function == "huber":
-            self.criterion = nn.HuberLoss()
+            self.criterion = nn.HuberLoss(reduction="none")
         else:
             raise ValueError(f"Unknown loss function: {loss_function}")
 
