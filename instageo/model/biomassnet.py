@@ -3,9 +3,11 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from monai.networks.nets import SwinUNETR
 from nnunet_mednext import MedNeXtBlock, MedNeXtDownBlock, MedNeXtUpBlock
+from nnunet_mednext.network_architecture.mednextv1.MedNextV1 import MedNeXt
 
-from transformers import AutoModel
+from transformers import AutoModel, AutoImageProcessor
 
 class DINOv3VITBlock(nn.Module):
     def __init__(self, model_name="facebook/dinov3-vitl16-pretrain-sat493m", freeze_backbone=True):
@@ -32,12 +34,31 @@ class DINOv3VITBlock(nn.Module):
         ])
 
     def extract_hierarchical_features(self, x):
-
         """
         Extracting hierarchical features from different DINOv3 transformer layers
         """
+        # Handle different input dimensions
+        original_shape = x.shape
+        
+        if x.dim() == 5:  # (B, C, T, H, W) - temporal dimension
+            B, C, T, H, W = x.shape
+            # Reshape to (B*T, C, H, W) for processing each timestep
+            x = x.view(B * T, C, H, W)
+            process_batch_size = B * T
+        elif x.dim() == 4:  # (B, C, H, W) - standard format
+            B, C, H, W = x.shape
+            process_batch_size = B
+        elif x.dim() == 3:  # (C, H, W) - missing batch dimension
+            C, H, W = x.shape
+            x = x.unsqueeze(0)  # Add batch dimension
+            B = 1
+            process_batch_size = B
+        else:
+            raise ValueError(f"Unexpected input shape: {x.shape}. Expected 3D, 4D, or 5D tensor.")
 
-        B, C, H, W = x.shape
+        # Ensure we have 18 channels total
+        if x.shape[1] != 18:
+            raise ValueError(f"Expected 18 channels, got {x.shape[1]} channels. Input shape: {original_shape}")
 
         x_proj = self.input_proj(x)
 
@@ -69,7 +90,7 @@ class DINOv3VITBlock(nn.Module):
             num_patches_w = target_w // self.patch_size
 
             spatial_features = patch_features.reshape(
-                B, num_patches_h, num_patches_w, self.embed_dim
+                process_batch_size, num_patches_h, num_patches_w, self.embed_dim
             ).permute(0, 3, 1, 2)
 
             if spatial_features.shape[2:] != (H, W):
@@ -77,6 +98,13 @@ class DINOv3VITBlock(nn.Module):
                     spatial_features, size=(H, W),
                     mode='bilinear', align_corners=False
                 )
+
+            # If we had 5D input, reshape back to include temporal dimension
+            if original_shape.__len__() == 5:
+                # Reshape from (B*T, C, H, W) back to (B, C, H, W) by averaging over time
+                B_orig = original_shape[0]
+                T_orig = original_shape[2]
+                spatial_features = spatial_features.view(B_orig, T_orig, -1, H, W).mean(dim=1)
 
             projected_features = self.feature_projections[i](spatial_features)
             hierarchical_features.append(projected_features)
@@ -229,6 +257,14 @@ class BiomassNet(nn.Module):
         self.use_skip_connections = use_skip
 
     def forward(self, x):
+        # Handle temporal dimension if present
+        original_shape = x.shape
+        
+        if x.dim() == 5:  # (B, C, T, H, W) - temporal dimension
+            B, C, T, H, W = x.shape
+            # Flatten temporal dimension into channels: (B, C*T, H, W)
+            x = x.view(B, C * T, H, W)
+        
         dinov3_features = self.dinov3_backbone(x)
 
         x = self.input_conv(x)
@@ -268,7 +304,7 @@ class BiomassNet(nn.Module):
 
         return biomass_map
 
-'''
+'''# Test the model
 if __name__ == "__main__":
     model = BiomassNet(
         in_channels=18,
@@ -277,11 +313,27 @@ if __name__ == "__main__":
         freeze_dinov3=True
     )
 
+    # Test with different input shapes
+    print("Testing different input shapes:")
+    
+    # 4D input (standard) - what your model expects
+    print("\n1. Testing 4D input (B, C, H, W):")
     x = torch.randn(4, 18, 128, 128)
-    biomass_pred = model(x)
-
-    print(f"Input shape: {x.shape}")
-    print(f"Predicted biomass map shape: {biomass_pred.shape}")
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    try:
+        biomass_pred = model(x)
+        print(f"Success! Input: {x.shape}, Output: {biomass_pred.shape}")
+    except Exception as e:
+        print(f"Error with 4D input: {e}")
+    
+    # 5D input (with temporal dimension) - if your dataloader provides this
+    print("\n2. Testing 5D input (B, C, T, H, W):")
+    x = torch.randn(4, 6, 3, 128, 128)  # 6 bands, 3 timesteps
+    try:
+        biomass_pred = model(x)
+        print(f"Success! Input: {x.shape}, Output: {biomass_pred.shape}")
+    except Exception as e:
+        print(f"Error with 5D input: {e}")
+    
+    print(f"\nModel parameters: {sum(p.numel() for p in model.parameters()):,}")
     print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 '''
