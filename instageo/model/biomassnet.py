@@ -23,10 +23,8 @@ class DINOv3VITBlock(nn.Module):
         self.patch_size = self.dinov3_model.config.patch_size
         self.num_layers = self.dinov3_model.config.num_hidden_layers
 
-        # Input projection to convert 18 channels to 3 for DINOv3
         self.input_proj = nn.Conv2d(18, 3, kernel_size=1, bias=False)
 
-        # Feature projections for each hierarchical level
         self.feature_projections = nn.ModuleList([
             nn.Conv2d(self.embed_dim, 64, kernel_size=1),
             nn.Conv2d(self.embed_dim, 128, kernel_size=1),
@@ -38,7 +36,6 @@ class DINOv3VITBlock(nn.Module):
     def extract_hierarchical_features(self, x):
         """Extract hierarchical features from different DINOv3 transformer layers"""
         
-        # Handle different input dimensions
         original_shape = x.shape
         
         if x.dim() == 5:  # (B, C, T, H, W) - temporal dimension
@@ -57,14 +54,11 @@ class DINOv3VITBlock(nn.Module):
         else:
             raise ValueError(f"Unexpected input shape: {x.shape}. Expected 3D, 4D, or 5D tensor.")
 
-        # Ensure we have 18 channels total
         if x.shape[1] != 18:
             raise ValueError(f"Expected 18 channels, got {x.shape[1]} channels. Input shape: {original_shape}")
 
-        # Project to 3 channels for DINOv3
         x_proj = self.input_proj(x)
 
-        # Ensure dimensions are compatible with patch size
         target_h = (H // self.patch_size) * self.patch_size
         target_w = (W // self.patch_size) * self.patch_size
 
@@ -72,12 +66,10 @@ class DINOv3VITBlock(nn.Module):
             x_proj = F.interpolate(x_proj, size=(target_h, target_w),
                                   mode='bilinear', align_corners=False)
 
-        # Extract features from DINOv3
         with torch.set_grad_enabled(self.dinov3_model.training):
             outputs = self.dinov3_model(x_proj, output_hidden_states=True)
             hidden_states = outputs.hidden_states
 
-        # Select layer indices for hierarchical features
         layer_indices = [
             max(1, self.num_layers // 6),
             self.num_layers // 3,
@@ -89,33 +81,26 @@ class DINOv3VITBlock(nn.Module):
         hierarchical_features = []
 
         for i, layer_idx in enumerate(layer_indices):
-            # Get patch features (skip CLS token and other special tokens)
             patch_features = hidden_states[layer_idx][:, 5:]
 
-            # Calculate number of patches
             num_patches_h = target_h // self.patch_size
             num_patches_w = target_w // self.patch_size
 
-            # Reshape to spatial format
             spatial_features = patch_features.reshape(
                 process_batch_size, num_patches_h, num_patches_w, self.embed_dim
             ).permute(0, 3, 1, 2)
 
-            # Resize to original spatial dimensions if needed
             if spatial_features.shape[2:] != (H, W):
                 spatial_features = F.interpolate(
                     spatial_features, size=(H, W),
                     mode='bilinear', align_corners=False
                 )
 
-            # If we had 5D input, reshape back to include temporal dimension
             if original_shape.__len__() == 5:
-                # Reshape from (B*T, C, H, W) back to (B, C, H, W) by averaging over time
                 B_orig = original_shape[0]
                 T_orig = original_shape[2]
                 spatial_features = spatial_features.view(B_orig, T_orig, -1, H, W).mean(dim=1)
 
-            # Project features to desired dimensions
             projected_features = self.feature_projections[i](spatial_features)
             hierarchical_features.append(projected_features)
 
@@ -154,7 +139,6 @@ class EncoderBlock(nn.Module):
     def forward(self, x, dinov3_features=None):
         x = self.mednext_block(x)
 
-        # Add DINOv3 features if provided
         if dinov3_features is not None:
             if x.shape[2:] != dinov3_features.shape[2:]:
                 dinov3_features = F.interpolate(
@@ -176,7 +160,6 @@ class DecoderBlock(nn.Module):
         super(DecoderBlock, self).__init__()
         self.skip_channels = skip_channels
 
-        # 2D upsampling block
         self.up_block = MedNeXtUpBlock(
             in_channels=in_channels,
             out_channels=out_channels,
@@ -235,7 +218,6 @@ class BiomassNet(nn.Module):
         self.use_skip_connections = use_skip_connections
         self.dinov3_backbone = DINOv3VITBlock(dinov3_model, freeze_dinov3)
         
-        # Input convolution to process all channels
         self.input_conv = nn.Conv2d(in_channels, 64, kernel_size=3, padding=1)
 
         # Encoder blocks
@@ -265,10 +247,9 @@ class BiomassNet(nn.Module):
             nn.GroupNorm(8, 32),
             nn.ReLU(inplace=True),
             nn.Conv2d(32, out_channels, kernel_size=1),
-            nn.ReLU(inplace=True)  # Ensure positive outputs for biomass
+            nn.ReLU(inplace=True)  
         )
 
-        # Initialize weights
         self._initialize_weights()
 
     def _initialize_weights(self):
@@ -287,22 +268,17 @@ class BiomassNet(nn.Module):
         self.use_skip_connections = use_skip
 
     def forward(self, x):
-        # Handle temporal dimension if present
         original_shape = x.shape
         
         if x.dim() == 5:  # (B, C, T, H, W) - temporal dimension
             B, C, T, H, W = x.shape
-            # Flatten temporal dimension into channels: (B, C*T, H, W)
             x = x.view(B, C * T, H, W)
         
-        # Extract hierarchical features from DINOv3
         dinov3_features = self.dinov3_backbone(x)
 
-        # Process input through initial convolution
         x = self.input_conv(x)
         skip_connections = []
 
-        # Encoder path with DINOv3 feature injection
         x, skip1 = self.encoder1(x, dinov3_features[0])
         skip_connections.append(skip1)
 
@@ -315,7 +291,6 @@ class BiomassNet(nn.Module):
         x, skip4 = self.encoder4(x, dinov3_features[3])
         skip_connections.append(skip4)
 
-        # Add bottleneck features if available
         if len(dinov3_features) > 4 and dinov3_features[4] is not None:
             bottleneck_features = dinov3_features[4]
             if x.shape[2:] != bottleneck_features.shape[2:]:
@@ -325,18 +300,15 @@ class BiomassNet(nn.Module):
                 )
             x = x + bottleneck_features
 
-        # Bottleneck processing
         x = self.bottleneck(x)
 
-        # Decoder path with skip connections
-        skip_connections = skip_connections[::-1]  # Reverse for decoder
+        skip_connections = skip_connections[::-1]  
 
         x = self.decoder4(x, skip_connections[0], self.use_skip_connections)
         x = self.decoder3(x, skip_connections[1], self.use_skip_connections)
         x = self.decoder2(x, skip_connections[2], self.use_skip_connections)
         x = self.decoder1(x, skip_connections[3], self.use_skip_connections)
 
-        # Final output
         biomass_map = self.output_conv(x)
 
         return biomass_map
